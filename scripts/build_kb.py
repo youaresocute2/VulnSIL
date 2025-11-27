@@ -1,234 +1,259 @@
-# scripts/build_kb.py
-import sys
-import os
+"""Build RAG knowledge base for VulnSIL.
+
+This script loads normalized DiverseVul and VCLData datasets, performs balanced
+stratified sampling, and exports a JSONL knowledge base suitable for RAG
+pipelines.
+"""
+from __future__ import annotations
+
 import json
-import glob
-import pickle
 import logging
-import numpy as np
-import faiss
-from tqdm import tqdm
-from rank_bm25 import BM25Okapi
+import random
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
 
-# 路径适配
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import typer
 
-from config import settings
-from vulnsil.database import get_db_session, engine, Base
-from vulnsil.models import KnowledgeBase
-from vulnsil.core.retrieval.vector_db_manager import EmbeddingModel
-# [关键] 引入压缩器以实现数据对齐
-from vulnsil.core.static_analysis.compressor import SemanticCompressor
-from vulnsil.utils_log import setup_logging
-
-setup_logging("build_kb")
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def parse_json_file(filepath: str):
-    """解析 JSON 或 JSONL 文件"""
-    records = []
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            if content.startswith('['):
-                try:
-                    records = json.loads(content)
-                except json.JSONDecodeError:
-                    pass
-            else:
-                lines = content.split('\n')
-                for line in lines:
-                    if line.strip():
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-    except Exception as e:
-        log.error(f"Read Error: {filepath} - {e}")
+@dataclass
+class Record:
+    """Container for a single input record."""
+
+    code: str | None
+    label: int | None
+    cwe: str | None
+    project: str | None
+    commit_id: str | None
+    source: str
+
+    @classmethod
+    def from_raw(cls, data: Dict, source: str) -> "Record":
+        return cls(
+            code=data.get("func"),
+            label=data.get("target"),
+            cwe=data.get("cwe"),
+            project=data.get("project"),
+            commit_id=data.get("commit_id"),
+            source=source,
+        )
+
+
+@dataclass
+class SampledRecord:
+    """Output record with assigned identifier."""
+
+    id: int
+    code: str | None
+    label: int | None
+    cwe: str | None
+    project: str | None
+    commit_id: str | None
+    source: str
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "id": self.id,
+                "code": self.code,
+                "label": self.label,
+                "cwe": self.cwe,
+                "project": self.project,
+                "commit_id": self.commit_id,
+                "source": self.source,
+            },
+            ensure_ascii=False,
+        )
+
+
+def load_jsonl(path: Path, source: str) -> List[Record]:
+    """Load records from a JSONL file, skipping malformed lines."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    records: List[Record] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                data = json.loads(stripped)
+                records.append(Record.from_raw(data, source))
+            except json.JSONDecodeError:
+                logger.warning("[WARN] JSON decode error at %s:%d; skipping line", path, line_no)
+                continue
+    logger.info("[INFO] Loaded %d records from %s", len(records), source.capitalize())
     return records
 
 
-def print_summary_table(stats: dict):
-    """打印统计报表"""
-    print("\n" + "=" * 65)
-    print(f" RAG IMPORT SUMMARY REPORT")
-    print("=" * 65)
-    print(f"{'DATASET FILE':<30} | {'IMPORTED (VULN)':<15} | {'SKIPPED':<15}")
-    print("-" * 65)
-    total_ok, total_skip = 0, 0
-    for fname, info in stats.items():
-        print(f"{fname:<30} | {info['added']:<15} | {info['skipped']:<15}")
-        total_ok += info['added']
-        total_skip += info['skipped']
-    print("-" * 65)
-    print(f"{'TOTAL':<30} | {total_ok:<15} | {total_skip:<15}")
-    print("=" * 65 + "\n")
+def group_by_layer(records: Iterable[Record]) -> Dict[Tuple[str | None, str | None], List[Record]]:
+    """Group records by (cwe, project) layer."""
+
+    layers: Dict[Tuple[str | None, str | None], List[Record]] = defaultdict(list)
+    for rec in records:
+        key = (rec.cwe, rec.project)
+        layers[key].append(rec)
+    return layers
 
 
-def import_rag_data_scan(db):
-    """步骤 1: 扫描 RAG 目录并入库 (原始数据)"""
-    rag_dir = os.path.join(settings.DATA_DIR, "data_RAG")
-    if not os.path.exists(rag_dir):
-        log.critical(f"RAG dir missing: {rag_dir}")
-        return {}
+def allocate_quotas(layer_counts: Dict[Tuple[str | None, str | None], int], target: int) -> Dict[Tuple[str | None, str | None], int]:
+    """Allocate quotas per layer using the largest remainder method."""
 
-    patterns = ["*.json", "*.jsonl"]
-    files = [f for pat in patterns for f in glob.glob(os.path.join(rag_dir, pat))]
+    if target <= 0 or not layer_counts:
+        return {layer: 0 for layer in layer_counts}
 
-    stats = {}
-    batch_size = settings.KB_BUILD_BATCH_INSERT_SIZE
-    buffer = []
+    total = sum(layer_counts.values())
+    quotas: Dict[Tuple[str | None, str | None], int] = {}
+    remainders: List[Tuple[float, Tuple[str | None, str | None]]] = []
 
-    for filepath in files:
-        fname = os.path.basename(filepath)
-        stats[fname] = {'added': 0, 'skipped': 0}
-        records = parse_json_file(filepath)
+    allocated = 0
+    for layer, count in layer_counts.items():
+        proportion = (count / total) * target
+        base = int(proportion)
+        quotas[layer] = base
+        allocated += base
+        remainders.append((proportion - base, layer))
+
+    remaining = max(target - allocated, 0)
+    for _, layer in sorted(remainders, key=lambda x: x[0], reverse=True):
+        if remaining <= 0:
+            break
+        quotas[layer] += 1
+        remaining -= 1
+
+    return quotas
+
+
+def stratified_sample(records: List[Record], target: int, rng: random.Random, desc: str) -> List[Record]:
+    """Perform approximate stratified sampling with fallback."""
+
+    if target <= 0 or not records:
+        return []
+
+    layers = group_by_layer(records)
+    layer_counts = {layer: len(items) for layer, items in layers.items()}
+    quotas = allocate_quotas(layer_counts, target)
+
+    sampled: List[Record] = []
+    remaining_pool: List[Record] = []
+
+    for layer, items in layers.items():
+        quota = quotas.get(layer, 0)
+        if quota <= 0:
+            remaining_pool.extend(items)
+            continue
+
+        if len(items) <= quota:
+            sampled.extend(items)
+        else:
+            chosen = rng.sample(items, quota)
+            sampled.extend(chosen)
+            remaining_pool.extend([rec for rec in items if rec not in chosen])
+
+    if len(sampled) < target and remaining_pool:
+        needed = target - len(sampled)
+        fallback_count = min(len(remaining_pool), needed)
+        sampled.extend(rng.sample(remaining_pool, fallback_count))
+
+    if len(sampled) < target:
+        logger.warning(
+            "[WARN] Unable to reach target=%d for %s; sampled %d records.", target, desc, len(sampled)
+        )
+
+    rng.shuffle(sampled)
+    return sampled[:target]
+
+
+def build_kb(
+    diversevul_path: Path,
+    vcldata_path: Path,
+    output_path: Path,
+    real_pos: int,
+    real_neg: int,
+    syn_pos: int,
+    syn_neg: int,
+    seed: int,
+) -> None:
+    rng = random.Random(seed)
+
+    diversevul_records = load_jsonl(diversevul_path, "diversevul")
+    vcldata_records = load_jsonl(vcldata_path, "vcldata")
+
+    real_records = diversevul_records
+    syn_records = vcldata_records
+
+    real_pos_pool = [r for r in real_records if r.label == 1]
+    real_neg_pool = [r for r in real_records if r.label == 0]
+    syn_pos_pool = [r for r in syn_records if r.label == 1]
+    syn_neg_pool = [r for r in syn_records if r.label == 0]
+
+    logger.info(
+        "[INFO] Source=diversevul: pos=%d neg=%d", len(real_pos_pool), len(real_neg_pool)
+    )
+    logger.info("[INFO] Source=vcldata: pos=%d neg=%d", len(syn_pos_pool), len(syn_neg_pool))
+
+    logger.info("[INFO] Building real KB: pos=%d neg=%d", real_pos, real_neg)
+    real_pos_sample = stratified_sample(real_pos_pool, real_pos, rng, "real-positive")
+    real_neg_sample = stratified_sample(real_neg_pool, real_neg, rng, "real-negative")
+
+    logger.info("[INFO] Building synthetic KB: pos=%d neg=%d", syn_pos, syn_neg)
+    syn_pos_sample = stratified_sample(syn_pos_pool, syn_pos, rng, "synthetic-positive")
+    syn_neg_sample = stratified_sample(syn_neg_pool, syn_neg, rng, "synthetic-negative")
+
+    all_samples: List[SampledRecord] = []
+    next_id = 1
+
+    def add_records(records: Iterable[Record]):
+        nonlocal next_id
         for rec in records:
-            if 'code' not in rec or 'label' not in rec:
-                stats[fname]['skipped'] += 1
-                continue
-            if rec['label'] != 1:  # 只导入漏洞数据（原逻辑）
-                stats[fname]['skipped'] += 1
-                continue
-            original_id = rec.get('commit_id', '') + '_' + rec.get('func_id', '')
-            obj = KnowledgeBase(
-                original_id=original_id,
-                code=rec['code'],
-                label=rec['label'],
-                cwe_id=rec.get('cwe_id', 'N/A'),
-                source_dataset=fname
+            all_samples.append(
+                SampledRecord(
+                    id=next_id,
+                    code=rec.code,
+                    label=rec.label,
+                    cwe=rec.cwe,
+                    project=rec.project,
+                    commit_id=rec.commit_id,
+                    source=rec.source,
+                )
             )
-            buffer.append(obj)
-            if len(buffer) >= batch_size:
-                try:
-                    db.bulk_save_objects(buffer)
-                    db.commit()
-                    stats[fname]['added'] += len(buffer)
-                    buffer = []
-                except Exception as e:
-                    db.rollback()
-                    log.error(f"Batch Insert Failed: {e}")
-                    stats[fname]['skipped'] += len(buffer)
-                    buffer = []
+            next_id += 1
 
-    if buffer:
-        try:
-            db.bulk_save_objects(buffer)
-            db.commit()
-            for b in buffer:
-                fname = b.source_dataset
-                stats[fname]['added'] += 1
-        except Exception as e:
-            db.rollback()
-            log.error(f"Final Batch Failed: {e}")
+    for subset in (real_pos_sample, real_neg_sample, syn_pos_sample, syn_neg_sample):
+        rng.shuffle(subset)
+        add_records(subset)
 
-    # 新增：导入负样本（安全代码）
-    neg_path = settings.RAG_NEGATIVE_DATA_PATH
-    if os.path.exists(neg_path):
-        log.info("导入负样本...")
-        neg_records = parse_json_file(neg_path)
-        neg_buffer = []
-        for rec in neg_records[:10000]:  # 抽样10k，控制时间
-            if 'code' not in rec or rec['label'] != 0:  # 只安全
-                continue
-            original_id = rec.get('commit_id', '') + '_' + rec.get('func_id', '')
-            obj = KnowledgeBase(
-                original_id=original_id,
-                code=rec['code'],
-                label=rec['label'],
-                cwe_id='N/A',  # 安全无CWE
-                source_dataset='negative_safe'
-            )
-            neg_buffer.append(obj)
-        if neg_buffer:
-            db.bulk_save_objects(neg_buffer)
-            db.commit()
-            log.info(f"添加 {len(neg_buffer)} 负样本")
+    final_count = len(all_samples)
+    logger.info("[INFO] Final KB size = %d", final_count)
 
-    print_summary_table(stats)
-    return stats
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for record in all_samples:
+            f.write(record.to_json() + "\n")
 
 
-def build_indices(db):
-    """步骤 2: 构建向量与稀疏索引"""
-    total_entries = db.query(KnowledgeBase).count()
-    if total_entries == 0:
-        log.error("No entries in KB. Skipping index build.")
-        return
+def build(
+    diversevul: Path = typer.Option(..., exists=True, readable=True, help="Path to normalized DiverseVul train JSONL"),
+    vcldata: Path = typer.Option(..., exists=True, readable=True, help="Path to normalized VCLData JSONL"),
+    output: Path = typer.Option(..., help="Path to output rag_kb.jsonl"),
+    real_pos: int = typer.Option(20000, help="Number of positive samples from real data"),
+    real_neg: int = typer.Option(20000, help="Number of negative samples from real data"),
+    syn_pos: int = typer.Option(20000, help="Number of positive samples from synthetic data"),
+    syn_neg: int = typer.Option(20000, help="Number of negative samples from synthetic data"),
+    seed: int = typer.Option(42, help="Random seed"),
+) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    build_kb(diversevul, vcldata, output, real_pos, real_neg, syn_pos, syn_neg, seed)
 
-    try:
-        encoder = EmbeddingModel()
-        compressor = SemanticCompressor()
-    except Exception as e:
-        log.critical(f"Init Failed: {e}")
-        return
 
-    chunk_size = settings.KB_BUILD_CHUNK_SIZE
-
-    vectors_list = []
-    tokenized_corpus = []
-    db_ids_list = []
-
-    log.info("Generating Embeddings (Batched)...")
-
-    for offset in range(0, total_entries, chunk_size):
-        entries = db.query(KnowledgeBase).offset(offset).limit(chunk_size).all()
-        if not entries: break
-
-        for item in tqdm(entries, desc=f"Chunk {offset // chunk_size + 1}", leave=False):
-            # 1. 语义压缩 (与 Inference 对齐)
-            if compressor:
-                try:
-                    processed_code = compressor.compress(item.code, settings.MAX_CODE_TOKENS_INPUT)
-                except:
-                    processed_code = item.code
-            else:
-                processed_code = item.code
-
-            # 2. Vector
-            vec = encoder.encode(processed_code)
-            vectors_list.append(vec)
-
-            # 3. BM25 Tokenize (简单按空字符分割)
-            tokenized_corpus.append(processed_code.split())
-
-            # 4. Mapping
-            db_ids_list.append(item.id)
-
-    if not vectors_list:
-        log.error("No vectors generated. Check data source.")
-        return
-
-    # FAISS Save (Inner Product + Normalized Vectors = Cosine Sim)
-    log.info("Creating FAISS Index...")
-    vectors_np = np.vstack(vectors_list).astype('float32')
-    index = faiss.IndexFlatIP(vectors_np.shape[1])
-    index.add(vectors_np)
-
-    os.makedirs(os.path.dirname(settings.FAISS_INDEX_PATH), exist_ok=True)
-    faiss.write_index(index, settings.FAISS_INDEX_PATH)
-    log.info(f"Saved FAISS -> {settings.FAISS_INDEX_PATH}")
-
-    # BM25 Save
-    log.info("Creating BM25 Index...")
-    bm25 = BM25Okapi(tokenized_corpus)
-    with open(settings.BM25_INDEX_PATH, 'wb') as f:
-        pickle.dump({'model': bm25, 'ids': db_ids_list}, f)
-    log.info(f"Saved BM25 -> {settings.BM25_INDEX_PATH}")
-
-    log.info("✅ Indexing Successfully Completed.")
+app = typer.Typer(help="Build VulnSIL RAG knowledge base")
+app.command()(build)
 
 
 if __name__ == "__main__":
-    try:
-        Base.metadata.create_all(bind=engine)
-        with get_db_session() as sess:
-            # Step 1
-            import_rag_data_scan(sess)
-            # Step 2
-            build_indices(sess)
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        log.critical(f"Fatal: {e}", exc_info=True)
+    app()
