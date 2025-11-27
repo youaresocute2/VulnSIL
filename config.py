@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     # 新增：时间切分参数（假设数据有'date'字段）
     TIME_SPLIT_RATIO: float = 0.8  # 训练/测试时序比例
 
-    # 新增：评估指标开关
+    # 新增：评估指标开关.
     USE_MCC: bool = True
     USE_AUPRC: bool = True
 
