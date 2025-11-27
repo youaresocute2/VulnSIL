@@ -16,6 +16,16 @@ from typing import Dict, Iterable, List, Tuple
 
 import typer
 
+# Ensure project root imports
+import os
+import sys
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, os.pardir))
+sys.path.append(PROJECT_ROOT)
+
+from vulnsil.core.retrieval.vector_db_manager import EmbeddingModel
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +64,7 @@ class SampledRecord:
     commit_id: str | None
     source: str
 
-    def to_json(self) -> str:
+    def to_json(self, embedding: List[float]) -> str:
         return json.dumps(
             {
                 "id": self.id,
@@ -64,6 +74,7 @@ class SampledRecord:
                 "project": self.project,
                 "commit_id": self.commit_id,
                 "source": self.source,
+                "embedding": embedding,
             },
             ensure_ascii=False,
         )
@@ -179,6 +190,7 @@ def build_kb(
     syn_neg: int,
     seed: int,
 ) -> None:
+    embedder = EmbeddingModel()
     rng = random.Random(seed)
 
     diversevul_records = load_jsonl(diversevul_path, "diversevul")
@@ -234,7 +246,8 @@ def build_kb(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         for record in all_samples:
-            f.write(record.to_json() + "\n")
+            embedding_vec = embedder.encode(record.code or "").astype(float).tolist()
+            f.write(record.to_json(embedding_vec) + "\n")
 
 
 def build(

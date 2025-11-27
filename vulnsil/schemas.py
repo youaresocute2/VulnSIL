@@ -44,6 +44,10 @@ class KnowledgeBaseEntry(BaseModel):
         default=None,
         description="Commit hash of the source code, if applicable.",
     )
+    source: Optional[str] = Field(
+        default=None,
+        description="Dataset source identifier for traceability (e.g., diversevul, vcldata).",
+    )
     label: Optional[int] = Field(
         default=None,
         description="Ground-truth label if known: 1 for vulnerable, 0 for safe.",

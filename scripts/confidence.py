@@ -1,190 +1,169 @@
-# scripts/confidence.py
-import sys
-import os
-import joblib
 import json
-import numpy as np
-import pandas as pd
-import typer
+import os
+from typing import Any, Dict, List, Sequence
+
+import joblib
 import lightgbm as lgb
+import numpy as np
+import typer
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+from sklearn.metrics import precision_recall_curve, roc_auc_score
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import settings
-from vulnsil.database import get_db_session
-from vulnsil.models import AnalysisResultRecord, Vulnerability
-from vulnsil.utils_log import setup_logging
+import sys
 
-app = typer.Typer()
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, os.pardir))
+sys.path.append(PROJECT_ROOT)
+
+from config import settings  # noqa: E402
+from vulnsil.database import Base, get_db_session  # noqa: E402
+from vulnsil.models import Vulnerability  # noqa: E402
+from vulnsil.utils_log import setup_logging  # noqa: E402
+from sqlalchemy import Column, Float, Integer, String, Text  # noqa: E402
+
 log = setup_logging("train_calibrator")
 
-# [更新] 15维特征列表（加graph_density）
-FEATURE_NAMES = [
-    "llm_native_conf",              # 1
-    "static_has_flow",              # 2
-    "static_complexity",            # 3
-    "static_apis_count",            # 4
-    "static_risk_density",          # 5
-    "source_type",                  # 6
-    "code_len_log",                 # 7
-    "is_compressed",                # 8
-    "rag_sim_avg",                  # 9
-    "rag_top1_sim",                 # 10
-    "rag_var",                      # 11
-    "conflict_disagree",            # 12
-    "conflict_static_yes_llm_no",   # 13
-    "llm_uncertainty",              # 14
-    "graph_density"                 # 15 新增
-]
+FEATURE_ORDER: Sequence[str] = (
+    "llm_confidence",
+    "llm_pred",
+    "has_flow",
+    "complexity",
+    "api_count",
+    "ast_has_dangerous",
+    "graph_density",
+    "rag_top1_similarity",
+    "rag_mean_similarity",
+    "rag_std_similarity",
+    "rag_positive_ratio",
+    "rag_support_agreement",
+    "conflict_disagree",
+    "rag_vote_margin",
+    "api_per_complexity",
+)
 
-def custom_pca(X, n_components):
-    """用numpy SVD实现PCA（环境兼容）"""
-    mean = np.mean(X, axis=0)
-    X_centered = X - mean
-    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
-    components = Vt[:n_components]
-    X_reduced = np.dot(X_centered, components.T)
-    return X_reduced
 
-def find_best_threshold_f1(y_true, y_probs):
+class Prediction(Base):
+    __tablename__ = "predictions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    dataset = Column(String, index=True, nullable=False)
+    llm_pred = Column(Integer, nullable=False)
+    llm_conf = Column(Float, nullable=False)
+    calibrated_conf = Column(Float, nullable=False)
+    final_pred = Column(Integer, nullable=False)
+    rag_result_json = Column(Text, nullable=False)
+    feature_json = Column(Text, nullable=False)
+
+
+def find_best_threshold_f1(y_true: np.ndarray, y_probs: np.ndarray) -> float:
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_probs)
     numerator = 2 * (precisions * recalls)
     denominator = precisions + recalls + 1e-10
     f1_scores = numerator / denominator
     best_idx = np.argmax(f1_scores)
-    best_th = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-    return best_th, f1_scores[best_idx], precisions[best_idx], recalls[best_idx]
+    return float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+
+
+def _extract_features(feature_json: str) -> Dict[str, float]:
+    try:
+        payload = json.loads(feature_json)
+    except json.JSONDecodeError:
+        payload = {}
+    return {k: float(payload.get(k, 0.0)) for k in FEATURE_ORDER}
+
+
+app = typer.Typer()
+
 
 @app.command()
-def train(split_name: str = typer.Option(..., help="Dataset prefix (e.g., 'confidence_train')")):
-    X, y = [], []
+def train(dataset_prefix: str = typer.Option(..., help="Dataset prefix stored in predictions.dataset")) -> None:
+    X: List[List[float]] = []
+    y: List[int] = []
 
-    with get_db_session() as db:
-        records = db.query(AnalysisResultRecord).join(Vulnerability).filter(
-            Vulnerability.name.like(f"{split_name}%"),
-            Vulnerability.status == "Success"
-        ).all()
+    with get_db_session() as session:
+        records = (
+            session.query(Prediction, Vulnerability)
+            .join(Vulnerability, Vulnerability.name == Prediction.name)
+            .filter(Prediction.dataset.like(f"{dataset_prefix}%"))
+            .all()
+        )
 
         if not records:
-            log.error("No data for training.")
+            log.error("No prediction records found for training.")
             return
 
-        for r in records:
-            if r.final_decision is None:
-                continue
+        for pred, vuln in records:
+            features = _extract_features(pred.feature_json)
+            X.append([features.get(k, 0.0) for k in FEATURE_ORDER])
+            y.append(1 if vuln.ground_truth_label == 1 else 0)
 
-            # [改进] 加graph_density（假设从DB新增字段）
-            graph_density = r.feat_graph_density if hasattr(r, 'feat_graph_density') else 0.0
+    X_arr = np.array(X, dtype=float)
+    y_arr = np.array(y, dtype=int)
 
-            features = [
-                r.native_confidence,
-                1 if r.static_has_flow else 0,
-                r.static_complexity,
-                r.feat_static_apis_count,
-                r.feat_static_risk_density,
-                r.feat_static_source_type,
-                np.log1p(r.feat_code_len),
-                1 if r.feat_is_compressed else 0,
-                r.feat_rag_agreement,
-                r.feat_rag_top1_sim,
-                r.feat_rag_sim_variance,
-                r.feat_conflict_disagreement,
-                r.feat_conflict_static_yes_llm_no,
-                r.feat_llm_uncertainty,
-                graph_density  # 新增
-            ]
+    if settings.PCA_N_COMPONENTS < X_arr.shape[1]:
+        # simple PCA using numpy SVD for compatibility
+        mean = np.mean(X_arr, axis=0)
+        X_centered = X_arr - mean
+        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+        components = Vt[: settings.PCA_N_COMPONENTS]
+        X_reduced = np.dot(X_centered, components.T)
+        pca_model = {"mean": mean, "components": components}
 
-            label = 1 if r.vuln.ground_truth_label == 1 else 0
-            X.append(features)
-            y.append(label)
+        def _pca_transform(arr: np.ndarray) -> np.ndarray:
+            return np.dot(arr - mean, components.T)
 
-    if not X:
-        log.error("No valid data.")
-        return
+    else:
+        X_reduced = X_arr
+        pca_model = None
 
-    X = np.array(X)
-    y = np.array(y)
+        def _pca_transform(arr: np.ndarray) -> np.ndarray:
+            return arr
 
-    # [改进] PCA降维（用custom_pca）
-    if settings.PCA_N_COMPONENTS < X.shape[1]:
-        X = custom_pca(X, settings.PCA_N_COMPONENTS)
-
-    # [改进] 客观防泄露：计算统计阈值
-    rag_sims = X[:, 9]  # feat_rag_top1_sim index
-    sim_th = np.mean(rag_sims) + 3 * np.std(rag_sims)
-    X[:, 9] = np.where(X[:, 9] > sim_th, 0.8, X[:, 9])
-
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    X_train, X_val, y_train, y_val = train_test_split(X_reduced, y_arr, test_size=0.2, random_state=42, stratify=y_arr)
 
     params = {
-        'objective': 'binary',
-        'metric': 'auc',
-        'verbose': 1,
-        'learning_rate': 0.05,
-        'num_leaves': 31,
-        'max_depth': -1,
+        "objective": "binary",
+        "metric": "auc",
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "max_depth": -1,
+        "verbose": -1,
     }
 
     train_data = lgb.Dataset(X_train, label=y_train)
     val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
-    callbacks = [
-        lgb.early_stopping(stopping_rounds=50, verbose=True),
-        lgb.log_evaluation(period=100)
-    ]
-
     model = lgb.train(
         params,
         train_data,
-        num_boost_round=1000,
+        num_boost_round=400,
         valid_sets=[train_data, val_data],
-        valid_names=['train', 'valid'],
-        callbacks=callbacks
+        valid_names=["train", "valid"],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
     )
 
-    y_prob_val = model.predict(X_val)
-    best_th, best_f1, prec_at_best, recall_at_best = find_best_threshold_f1(y_val, y_prob_val)
-    val_auc = roc_auc_score(y_val, y_prob_val)
+    val_probs = model.predict(X_val)
+    best_th = find_best_threshold_f1(y_val, val_probs)
+    val_auc = roc_auc_score(y_val, val_probs)
 
-    print("\n" + "=" * 60)
-    print(" 🚀 CALIBRATION MODEL PERFORMANCE REPORT")
-    print("=" * 60)
-    print(f"Dataset Size     : Train={len(y_train)}, Val={len(y_val)}")
-    print(f"Validation AUC   : {val_auc:.4f} (Robustness Metric)")
-    print("-" * 60)
-    print(f"✅ Optimal Threshold : {best_th:.4f} (Decision Boundary)")
-    print(f"🎯 Max F1-Score      : {best_f1:.4f}")
-    print(f"   Corresponding P   : {prec_at_best:.4f}")
-    print(f"   Corresponding R   : {recall_at_best:.4f}")
-    print("-" * 60)
+    models_dir = os.path.join(PROJECT_ROOT, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    joblib.dump(model, os.path.join(models_dir, "confidence_model.pkl"))
+    if pca_model is not None:
+        joblib.dump(pca_model, os.path.join(models_dir, "pca.pkl"))
 
-    print("\n📊 Feature Importance (Gain):")
-    importance = model.feature_importance(importance_type='gain')
-    if sum(importance) > 0:
-        importance = importance / sum(importance) * 100
-
-    indices = np.argsort(importance)[::-1]
-    for i in indices:
-        print(f"   {FEATURE_NAMES[i]:<30}: {importance[i]:6.2f}%")
-
-    model_dir = os.path.dirname(settings.CONFIDENCE_MODEL_PATH)
-    os.makedirs(model_dir, exist_ok=True)
-    joblib.dump(model, settings.CONFIDENCE_MODEL_PATH)
-
-    meta_path = settings.CONFIDENCE_META_PATH
-    meta_data = {
+    meta = {
         "best_threshold": float(best_th),
-        "best_f1": float(best_f1),
-        "auc": float(val_auc),
-        "train_info": f"Split: {split_name}, Samples: {len(X)}"
+        "feature_order": list(FEATURE_ORDER),
+        "val_auc": float(val_auc),
+        "dataset_prefix": dataset_prefix,
     }
-    with open(meta_path, "w") as f:
-        json.dump(meta_data, f, indent=2)
+    with open(os.path.join(models_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
-    print(f"\n✅ Model saved to: {settings.CONFIDENCE_MODEL_PATH}")
-    print(f"✅ Threshold info saved to: {meta_path}")
-    print("=" * 60 + "\n")
+    log.info("Training complete. AUC=%.4f Threshold=%.4f", val_auc, best_th)
+
 
 if __name__ == "__main__":
     app()
