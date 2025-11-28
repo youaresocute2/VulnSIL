@@ -1,17 +1,17 @@
-# scripts/evaluate.py
+# --- START OF FILE evaluate.py ---
+
 import sys
 import os
 import typer
 import pandas as pd
-import numpy as np
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, matthews_corrcoef, average_precision_score  # 新增MCC/AUPRC
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, matthews_corrcoef, \
+    average_precision_score
 
-# 适配路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import settings
 from vulnsil.database import get_db_session
-from vulnsil.models import AnalysisResultRecord, Vulnerability
+from vulnsil.models import Prediction, AnalysisResultRecord, Vulnerability
 from vulnsil.utils_log import setup_logging
 
 app = typer.Typer()
@@ -19,7 +19,7 @@ log = setup_logging("evaluation")
 
 
 def get_metrics(y_true, y_pred, y_prob=None):
-    """辅助函数：计算核心指标 [改进] 加MCC/AUPRC"""
+    """通用指标计算"""
     metrics = {
         "Accuracy": accuracy_score(y_true, y_pred),
         "Precision": precision_score(y_true, y_pred, zero_division=0),
@@ -34,81 +34,83 @@ def get_metrics(y_true, y_pred, y_prob=None):
             if settings.USE_AUPRC:
                 metrics["AUPRC"] = average_precision_score(y_true, y_prob)
         except:
-            metrics["AUC"] = 0.0
-            metrics["AUPRC"] = 0.0
+            pass
     return metrics
 
 
 @app.command()
 def eval(
-        split_name: str = typer.Option(..., help="Dataset prefix (e.g., 'diversevul_test')"),
-        force_threshold: float = typer.Option(None, help="Override the loaded calibration threshold temporarily")
+        split_name: str = typer.Option(..., help="Target dataset split (e.g. diversevul_test)"),
+        force_threshold: float = typer.Option(None, help="Manually override calibration threshold"),
+        use_prediction_table: bool = typer.Option(True, help="Read from new Prediction table")
 ):
     """
-    Run comprehensive evaluation comparing 'Raw LLM' vs 'Calibrated Model'.
-    Prints improvement deltas for paper tables.
-    [改进] 加MCC/AUPRC
+    Evaluate Model Performance.
+    Can switch between legacy results and new prediction table results.
     """
-    log.info(f"📊 Evaluating split: {split_name}")
-
-    # 1. 确定使用的阈值
-    # 如果用户没有在命令行指定，就使用 Config 自动加载的最佳阈值
-    final_threshold = force_threshold if force_threshold is not None else settings.CALIBRATION_THRESHOLD
-    log.info(f"⚙️ Using Calibration Threshold: {final_threshold:.4f}")
+    log.info(f"Evaluating Split: {split_name}")
+    threshold = force_threshold if force_threshold is not None else settings.CALIBRATION_THRESHOLD
+    log.info(f"Using Threshold: {threshold:.4f}")
 
     data = []
 
     with get_db_session() as db:
-        records = db.query(AnalysisResultRecord).join(Vulnerability).filter(
-            Vulnerability.name.like(f"{split_name}%"),
-            Vulnerability.status == "Success"
-        ).all()
+        if use_prediction_table:
+            log.info("Querying 'Prediction' table...")
+            # 连接 Prediction 和 Vulnerability 表
+            records = db.query(Prediction).join(Vulnerability).filter(
+                Vulnerability.name.like(f"{split_name}%")
+            ).all()
 
-        for r in records:
-            gt = r.vuln.ground_truth_label
-            raw_pred = 1 if r.final_decision == "VULNERABLE" else 0
-            cal_prob = r.calibrated_confidence
-            cal_pred = 1 if cal_prob >= final_threshold else 0
-            cwe = r.vuln.cwe_id or "N/A"
-            data.append({'gt_label': gt, 'raw_pred': raw_pred, 'cal_prob': cal_prob, 'cal_pred': cal_pred, 'cwe': cwe})
+            for r in records:
+                data.append({
+                    'gt': r.vuln.ground_truth_label,
+                    'raw_pred': r.llm_pred,
+                    'prob': r.calibrated_confidence,
+                    # 可以基于存储的 prob 动态调整阈值，而不是仅仅读 final_pred
+                    'cal_pred': 1 if r.calibrated_confidence >= threshold else 0,
+                    'cwe': r.vuln.cwe_id
+                })
+        else:
+            log.info("Querying 'AnalysisResultRecord' table (Legacy)...")
+            records = db.query(AnalysisResultRecord).join(Vulnerability).filter(
+                Vulnerability.name.like(f"{split_name}%")
+            ).all()
+
+            for r in records:
+                raw_flag = 1 if "VULNERABLE" in str(r.final_decision).upper() else 0
+                data.append({
+                    'gt': r.vuln.ground_truth_label,
+                    'raw_pred': raw_flag,
+                    'prob': r.calibrated_confidence,
+                    'cal_pred': 1 if r.calibrated_confidence >= threshold else 0,
+                    'cwe': r.vuln.cwe_id
+                })
 
     if not data:
-        log.error("No data for evaluation.")
+        log.error("No results found for this split.")
         return
 
     df = pd.DataFrame(data)
-    y_true = df['gt_label']
-    y_raw = df['raw_pred']
-    y_cal = df['cal_pred']
-    y_prob = df['cal_prob']
 
-    metrics_raw = get_metrics(y_true, y_raw)
-    metrics_cal = get_metrics(y_true, y_cal, y_prob)
+    # 打印对比报告
+    m_raw = get_metrics(df['gt'], df['raw_pred'])
+    m_cal = get_metrics(df['gt'], df['cal_pred'], df['prob'])
 
-    print("\n" + "-" * 75)
-    print(" 📊 PERFORMANCE COMPARISON: Baseline (Raw LLM) vs Ours (Calibrated)")
-    print("-" * 75)
-    print(f"{'Metric':<15} | {'Baseline':<20} | {'Ours':<20} | {'Improvement':<12}")
-    print("-" * 75)
+    print("\n" + "=" * 60)
+    print(f"📊 Evaluation Report [{split_name}]")
+    print(f"Sample Count: {len(df)}")
+    print("=" * 60)
+    print(f"{'Metric':<12} | {'Raw LLM':<15} | {'Calibrated':<15} | {'Delta':<10}")
+    print("-" * 60)
 
-    for k in metrics_cal:
-        v_base = metrics_raw.get(k, 0.0)
-        v_ours = metrics_cal[k]
-        delta = v_ours - v_base
-        delta_str = f"{'+' if delta >= 0 else ''}{delta:.2%}"
-        print(f"{k:<15} | {v_base:<20.2%} | {v_ours:<20.2%} | {delta_str:<12}")
+    for k, v_cal in m_cal.items():
+        v_raw = m_raw.get(k, 0.0)
+        diff = v_cal - v_raw
+        sign = "+" if diff >= 0 else ""
+        print(f"{k:<12} | {v_raw:.4f}          | {v_cal:.4f}          | {sign}{diff:.4f}")
 
-    print("-" * 75)
-
-    # 混淆矩阵等原逻辑...
-
-    print("\n" + "-" * 70)
-    print(" 📉 Top 10 CWE Breakdown (Sensitivity Analysis)")
-    print("-" * 70)
-
-    # CWE 原逻辑...
-
-    print("=" * 70 + "\n")
+    print("-" * 60 + "\n")
 
 
 if __name__ == "__main__":
