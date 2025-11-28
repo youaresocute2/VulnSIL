@@ -1,12 +1,12 @@
-# VulnSIL/config.py
+# --- START OF FILE config.py ---
+
 import os
 import json
 import logging
+import multiprocessing
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import multiprocessing  # 新增导入
 
 PROJECT_ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
-
 
 class Settings(BaseSettings):
     # --- 基础路径 ---
@@ -16,8 +16,7 @@ class Settings(BaseSettings):
     DB_DIR: str = os.path.join(RESULTS_DIR, 'database')
 
     # Linux下优先使用内存盘(/dev/shm)以极大提升 Joern IO速度
-    STATIC_TMP_DIR: str = "/dev/shm/vulnsil_tmp" if os.path.exists("/dev/shm") else os.path.join(PROJECT_ROOT_DIR,
-                                                                                                 "temp_work")
+    STATIC_TMP_DIR: str = "/dev/shm/vulnsil_tmp" if os.path.exists("/dev/shm") else os.path.join(PROJECT_ROOT_DIR, "temp_work")
 
     # RAG资源
     FAISS_INDEX_PATH: str = os.path.join(RESULTS_DIR, 'faiss_index', 'kb.faiss')
@@ -28,12 +27,28 @@ class Settings(BaseSettings):
     # 数据库
     DATABASE_URI: str = f"sqlite:///{os.path.join(DB_DIR, 'vulnsil.db')}"
 
-    # 模型路径
+    # --- 模型路径 (新增) ---
+    # 训练好的LightGBM模型
     CONFIDENCE_MODEL_PATH: str = os.path.join(RESULTS_DIR, 'confidence', 'lgb_model.joblib')
+    # PCA模型 (可选)
+    CONFIDENCE_PCA_PATH: str = os.path.join(RESULTS_DIR, 'confidence', 'pca_model.joblib')
+    # 模型元数据 (阈值、特征名)
     CONFIDENCE_META_PATH: str = os.path.join(RESULTS_DIR, 'confidence', 'model_meta.json')
 
+    # [核心设计] 默认15维特征顺序，必须与训练时保持一致
+    DEFAULT_FEATURE_ORDER: list = [
+        "llm_confidence", "llm_pred",
+        "static_has_flow", "static_complexity", "static_api_count", "static_risk_density",
+        "static_source_type",
+        "rag_top1_similarity", "rag_mean_similarity", "rag_std_similarity", "rag_positive_ratio", "rag_support_agreement",
+        "conflict_disagree",
+        "graph_density",
+        "code_len_log"
+    ]
+
     # --- LLM 配置 ---
-    LLM_API_URL: str = "http://localhost:8000/v1/chat/completions"
+    LLM_API_BASE: str = "http://localhost:8000/v1"  # 根据实际 vLLM 或 API 地址修改
+    LLM_API_KEY: str = "EMPTY"
     LLM_MODEL_NAME: str = "Llama-3.1-8B-Instruct"
     LLM_MAX_MODEL_LEN: int = 14480
     LLM_MAX_TOKENS: int = 2048
@@ -44,18 +59,16 @@ class Settings(BaseSettings):
     # --- Embedding / Static Config ---
     EMBEDDING_MODEL_PATH: str = "/home/daiwenju/codebert-base"
 
-    # [核心修改] 指定 GPU 0 和 CPU 混合部署 (逗号分隔)
+    # 指定 GPU 0 和 CPU 混合部署
     EMBEDDING_DEVICE: str = "cuda:0,cpu"
 
     # 静态分析路径
     JOERN_CLI_PATH: str = "/home/daiwenju/joern4.0.443/joern-cli/joern"
     C2CPG_PATH: str = "/home/daiwenju/joern4.0.443/joern-cli/c2cpg.sh"
-
-    # [优化] Joern JVM
     JOERN_JAVA_OPTS: str = "-Xmx14g -Xms4g"
     JOERN_JAVA_OPTIONS: str = "-Xmx14g -Xms4g"
 
-    # [优化] 超时设置
+    # 超时设置
     STATIC_PARSE_TIMEOUT: int = 900  # 15 min
     STATIC_QUERY_TIMEOUT: int = 1200  # 20 min
 
@@ -68,7 +81,7 @@ class Settings(BaseSettings):
     KB_BUILD_CHUNK_SIZE: int = 1000
     KB_BUILD_BATCH_INSERT_SIZE: int = 500
 
-    # 默认阈值
+    # 默认阈值 (会被 model_meta.json 覆盖)
     CALIBRATION_THRESHOLD: float = 0.5
 
     # 并发控制
@@ -76,29 +89,18 @@ class Settings(BaseSettings):
     STATIC_ANALYSIS_BATCH_SIZE: int = 200
     TORCH_NUM_THREADS: int = 1
 
-    # 新增参数：图特征（用Tree-sitter代替NetworkX）
-    TREE_SITTER_GRAPH_METRICS: bool = True  # 使用Tree-sitter计算节点深度/计数
-
-    # 新增：PCA降维
+    # 特征参数
+    TREE_SITTER_GRAPH_METRICS: bool = True
     PCA_N_COMPONENTS: int = 10
 
-    # 新增：RAG负样本路径（假设用户提供DiverseVul-safe JSONL）
-    RAG_NEGATIVE_DATA_PATH: str = os.path.join(DATA_DIR, 'diversevul_safe.jsonl')  # 需用户填充
-
-    # 新增：Agentic Loop迭代次数
-    AGENTIC_MAX_ITER: int = 2
-
-    # 新增：时间切分参数（假设数据有'date'字段）
-    TIME_SPLIT_RATIO: float = 0.8  # 训练/测试时序比例
-
-    # 新增：评估指标开关.
+    # 评估指标开关
     USE_MCC: bool = True
     USE_AUPRC: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     def model_post_init(self, __context):
-        # [修改] 仅在主进程打印日志，防止 16 个子进程刷屏
+        # 仅在主进程打印日志
         if multiprocessing.current_process().name == 'MainProcess':
             if os.path.exists(self.CONFIDENCE_META_PATH):
                 try:
@@ -115,5 +117,6 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# 确保目录存在
 for path in [settings.RESULTS_DIR, settings.LOG_DIR, settings.DB_DIR, settings.STATIC_TMP_DIR]:
     os.makedirs(path, exist_ok=True)
