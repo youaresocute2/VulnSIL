@@ -41,9 +41,12 @@ def scan_rag_folder(base_dir: Path) -> List[Dict]:
                     code = data.get("func", "") or ""
                     raw_label = data.get("target")
                     try:
-                        label = int(raw_label) if raw_label is not None else None
+                        label = int(raw_label)
                     except Exception:
-                        label = None
+                        logger.warning(
+                            "[WARN] Invalid label at %s:%d; defaulting to 0", path, line_no
+                        )
+                        label = 0
 
                     record = {
                         "original_id": f"{path.relative_to(base_dir)}:{line_no}",
