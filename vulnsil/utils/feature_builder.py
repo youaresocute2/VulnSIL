@@ -2,6 +2,7 @@
 
 import numpy as np
 import logging
+from enum import Enum
 from typing import Dict, List, Any, Tuple
 from vulnsil.schemas import AnalysisResult
 from config import settings
@@ -41,8 +42,13 @@ class FeatureBuilder:
 
         # --- 2. LLM 特征 ---
         # 获取 LLM 是否判断为 Vuln (兼容大小写字符串和Enum)
-        decision_val = str(llm_result.decision) if hasattr(llm_result.decision, 'value') else str(llm_result.decision)
-        llm_pred = 1.0 if decision_val.upper() in ["VULNERABLE", "1", "TRUE"] else 0.0
+        if hasattr(llm_result.decision, "value"):
+            decision_val = llm_result.decision.value
+        else:
+            decision_val = llm_result.decision if not isinstance(llm_result.decision, Enum) else llm_result.decision.value
+
+        decision_str = str(decision_val)
+        llm_pred = 1.0 if decision_str.lower() in ["vulnerable", "1", "true"] else 0.0
         llm_conf = float(llm_result.confidence)
 
         # --- 3. 静态分析特征 ---

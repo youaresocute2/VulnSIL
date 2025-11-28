@@ -24,6 +24,7 @@ class RAGClient:
         self.embedding_model = EmbeddingModel()
         self.index = None
         self.kb_meta_cache = {}
+        self.ids_map = []
         self._load_resources()
 
     def _load_resources(self):
@@ -36,6 +37,13 @@ class RAGClient:
             else:
                 logger.warning(f"[RAGClient] FAISS Index missing at {settings.FAISS_INDEX_PATH}")
 
+            if settings.FAISS_IDS_MAP_PATH and os.path.exists(settings.FAISS_IDS_MAP_PATH):
+                with open(settings.FAISS_IDS_MAP_PATH, "r") as f:
+                    raw_map = json.load(f)
+                    self.ids_map = [int(raw_map[str(i)]) for i in sorted(map(int, raw_map.keys()))]
+            else:
+                logger.error(f"[RAGClient] faiss_ids_map.json missing at {settings.FAISS_IDS_MAP_PATH}")
+
             # 2. 预加载 KB 元数据以提高检索速度
             # 注意：如果数据量过大 (>百万级)，请改为 Redis 或 SQL 实时查询
             logger.info("[RAGClient] Pre-loading KnowledgeBase metadata...")
@@ -46,7 +54,6 @@ class RAGClient:
                     KnowledgeBase.cwe_id,
                     KnowledgeBase.original_id
                 ).all()
-                # 假设 FAISS ID 与 DB ID 一一对应
                 self.kb_meta_cache = {e.id: e for e in entries}
             logger.info(f"[RAGClient] Loaded metadata for {len(self.kb_meta_cache)} entries.")
 
@@ -62,7 +69,7 @@ class RAGClient:
           ...
         ]
         """
-        if not self.index or not self.embedding_model:
+        if not self.index or not self.embedding_model or not self.ids_map:
             return []
 
         if not code or not code.strip():
@@ -81,7 +88,11 @@ class RAGClient:
                     if idx == -1:
                         continue
 
-                    real_id = int(idx)
+                    if idx >= len(self.ids_map):
+                        logger.error(f"[RAGClient] Missing mapping for vector id {idx}")
+                        continue
+
+                    real_id = int(self.ids_map[idx])
                     score = float(scores[0][rank])
 
                     # 获取缓存的元数据

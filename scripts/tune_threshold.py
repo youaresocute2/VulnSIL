@@ -9,9 +9,12 @@ import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import settings
+from config import settings, init_runtime
+
+init_runtime()
+
 from vulnsil.database import get_db_session
-from vulnsil.models import AnalysisResultRecord, Vulnerability
+from vulnsil.models import Prediction, Vulnerability
 from vulnsil.utils_log import setup_logging
 
 app = typer.Typer()
@@ -26,10 +29,11 @@ def tune(
     Tune calibration threshold on target dataset for domain adaptation.
     Searches 0.1-0.9 for Max F1.
     """
+    init_runtime()
     data = []
 
     with get_db_session() as db:
-        records = db.query(AnalysisResultRecord).join(Vulnerability).filter(
+        records = db.query(Prediction).join(Vulnerability).filter(
             Vulnerability.name.like(f"{split_name}%"),
             Vulnerability.status == "Success"
         ).all()

@@ -20,9 +20,13 @@ try:
 except:
     pass
 
+from config import settings, init_runtime
+
+init_runtime()
+
 # 引入核心模块
 from vulnsil.database import SessionLocal, get_db_session
-from vulnsil.models import Vulnerability, AnalysisResultRecord, StaticAnalysisCache, Prediction
+from vulnsil.models import Vulnerability, StaticAnalysisCache, Prediction
 from vulnsil.core.rag.client import RAGClient
 from vulnsil.core.llm.service import LLMService
 from vulnsil.core.confidence import ConfidenceModel
@@ -30,7 +34,6 @@ from vulnsil.utils.feature_builder import FeatureBuilder
 from vulnsil.core.static_analysis.compressor import SemanticCompressor
 from vulnsil.core.static_analysis.ast_analyzer import ASTHeuristicAnalyzer
 from vulnsil.utils_log import setup_logging
-from config import settings
 
 app = typer.Typer()
 logger = setup_logging("pipeline")
@@ -183,10 +186,17 @@ def process_inference(task: Vulnerability, cache: StaticAnalysisCache):
         calib_conf, final_pred = _conf_model.predict(feat_vector)
 
         # 6. 生成结果记录 (New Table)
+        kb_evidence_json = json.dumps([e.model_dump() for e in llm_result.kb_evidence]) if llm_result.kb_evidence else json.dumps([])
         prediction = Prediction(
             vuln_id=task.id,
             name=task.name,
             dataset=task.dataset or "unknown",
+            is_vulnerable=bool(llm_result.is_vulnerable),
+            confidence=float(llm_result.confidence),
+            decision=str(llm_result.decision.value if hasattr(llm_result.decision, "value") else llm_result.decision),
+            cwe=llm_result.cwe,
+            reasoning=llm_result.reasoning[:3000],
+            kb_evidence=kb_evidence_json,
             llm_pred=int(feat_dict['llm_pred']),
             llm_native_confidence=feat_dict['llm_confidence'],
             llm_reasoning=llm_result.reasoning[:3000],
@@ -286,6 +296,7 @@ def run(split_name: str = typer.Option(..., help="Dataset split name like divers
     """
     Main Entry Point: Load pending tasks and run the RAG-LLM pipeline.
     """
+    init_runtime()
     ensure_resources(device)
 
     logger.info(f"🚀 Starting Pipeline for split: {split_name}")

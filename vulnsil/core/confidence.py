@@ -62,6 +62,12 @@ class ConfidenceModel:
             # 如果没有模型（未训练阶段），返回默认 0.5 中性
             return 0.5, 0
 
+        feature_names = self.get_feature_names()
+        if feature_vector.shape[0] != len(feature_names):
+            msg = f"Feature length mismatch: expected {len(feature_names)}, got {feature_vector.shape[0]}"
+            logger.error(msg)
+            raise ValueError(msg)
+
         # Reshape for sklearn/lgb
         X = feature_vector.reshape(1, -1)
 

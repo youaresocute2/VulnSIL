@@ -4,6 +4,7 @@ import numpy as np
 import logging
 import os
 import faiss
+import json
 from typing import List, Dict
 
 from config import settings
@@ -34,11 +35,20 @@ class HybridRetriever:
             else:
                 logger.warning("FAISS index missing.")
 
+            if os.path.exists(settings.FAISS_IDS_MAP_PATH):
+                with open(settings.FAISS_IDS_MAP_PATH, "r") as f:
+                    raw_map = json.load(f)
+                    # JSON keys are str indices
+                    self.ids_map = [int(raw_map[str(i)]) for i in sorted(map(int, raw_map.keys()))]
+            else:
+                logger.error(f"faiss_ids_map.json missing at {settings.FAISS_IDS_MAP_PATH}")
+
             if os.path.exists(settings.BM25_INDEX_PATH):
                 with open(settings.BM25_INDEX_PATH, 'rb') as f:
                     data = pickle.load(f)
                     self.bm25_model = data['model']
-                    self.ids_map = data['ids']
+                    if not self.ids_map:
+                        self.ids_map = data['ids']
             else:
                 logger.warning("BM25 index missing.")
 
@@ -59,7 +69,7 @@ class HybridRetriever:
         混合检索代码
         [改进] 统一压缩query以对齐嵌入空间
         """
-        if not self.faiss_index or not self.embedding_model:
+        if not self.faiss_index or not self.embedding_model or not self.ids_map:
             return []
 
         # 新增：统一压缩query
@@ -122,7 +132,7 @@ class HybridRetriever:
                             id=rec.id,
                             original_id=rec.original_id,
                             code=rec.code,
-                            label=rec.label,
+                            label=int(rec.label) if rec.label is not None else None,
                             cwe_id=rec.cwe_id if rec.cwe_id else "N/A",
                             similarity_score=real_sim  # 传递真实相似度，而非 RRF 分数
                         )

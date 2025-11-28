@@ -9,8 +9,8 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vulnsil.database import get_db_session, engine, Base
 # 引入所有模型以确保 SQLAlchemy 能正确识别表关系
-from vulnsil.models import Vulnerability, AnalysisResultRecord, StaticAnalysisCache, KnowledgeBase
-from config import settings
+from vulnsil.models import Vulnerability, StaticAnalysisCache, KnowledgeBase, Prediction
+from config import settings, init_runtime
 
 # 初始化日志
 logging.basicConfig(
@@ -51,7 +51,7 @@ def perform_cleanup(db, mode):
         # 保留: 漏洞任务(Vulnerability), 静态分析(StaticAnalysisCache), RAG(KnowledgeBase)
         if mode == 'results_only':
             log.info("Action: Clearing Analysis Results...")
-            deleted_res = db.query(AnalysisResultRecord).delete()
+            deleted_res = db.query(Prediction).delete()
 
             log.info("Action: Resetting Vulnerability status to 'Pending'...")
             updated_vulns = db.query(Vulnerability).update(
@@ -67,7 +67,7 @@ def perform_cleanup(db, mode):
         # 保留: 漏洞任务(Vulnerability), RAG(KnowledgeBase)
         if mode == 'results_and_static':
             log.info("Action: Clearing Analysis Results...")
-            deleted_res = db.query(AnalysisResultRecord).delete()
+            deleted_res = db.query(Prediction).delete()
 
             log.info("Action: Clearing Static Cache...")
             deleted_cache = db.query(StaticAnalysisCache).delete()
@@ -86,7 +86,7 @@ def perform_cleanup(db, mode):
         # 保留: RAG(KnowledgeBase)
         if mode == 'all_tasks':
             log.info("Action: Clearing Analysis Results...")
-            deleted_res = db.query(AnalysisResultRecord).delete()
+            deleted_res = db.query(Prediction).delete()
 
             log.info("Action: Clearing Static Cache...")
             deleted_cache = db.query(StaticAnalysisCache).delete()
@@ -101,7 +101,7 @@ def perform_cleanup(db, mode):
         # 模式 4: 清空所有，包括 RAG (--clear_all_including_rag)
         if mode == 'all_including_rag':
             log.info("Action: Clearing Analysis Results...")
-            deleted_res = db.query(AnalysisResultRecord).delete()
+            deleted_res = db.query(Prediction).delete()
 
             log.info("Action: Clearing Static Cache...")
             deleted_cache = db.query(StaticAnalysisCache).delete()
@@ -187,6 +187,8 @@ if __name__ == "__main__":
                         help="Dataset split prefix (Required for import), e.g. diversevul_test")
 
     args = parser.parse_args()
+
+    init_runtime()
 
     # 1. 处理 Recreate
     if args.recreate:
