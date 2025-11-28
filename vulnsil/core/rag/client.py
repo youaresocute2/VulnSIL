@@ -42,7 +42,10 @@ class RAGClient:
                     raw_map = json.load(f)
                     self.ids_map = [int(raw_map[str(i)]) for i in sorted(map(int, raw_map.keys()))]
             else:
-                logger.error(f"[RAGClient] faiss_ids_map.json missing at {settings.FAISS_IDS_MAP_PATH}")
+                raise FileNotFoundError(
+                    f"faiss_ids_map.json missing at {settings.FAISS_IDS_MAP_PATH}. "
+                    "Ensure FAISS id mapping is built alongside the index."
+                )
 
             # 2. 预加载 KB 元数据以提高检索速度
             # 注意：如果数据量过大 (>百万级)，请改为 Redis 或 SQL 实时查询

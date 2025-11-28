@@ -13,8 +13,6 @@ from sklearn.metrics import roc_auc_score, precision_recall_curve
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings, init_runtime
 
-init_runtime()
-
 from vulnsil.database import get_db_session
 from vulnsil.models import Prediction, Vulnerability
 from vulnsil.utils_log import setup_logging
@@ -45,6 +43,7 @@ def find_best_threshold_f1(y_true, y_probs):
 
 @app.command()
 def train(split_name: str = typer.Option(..., help="Dataset prefix (e.g., 'confidence_train')")):
+    init_runtime()
     X, y = [], []
 
     with get_db_session() as db:

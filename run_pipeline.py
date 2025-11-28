@@ -22,8 +22,6 @@ except:
 
 from config import settings, init_runtime
 
-init_runtime()
-
 # 引入核心模块
 from vulnsil.database import SessionLocal, get_db_session
 from vulnsil.models import Vulnerability, StaticAnalysisCache, Prediction
@@ -186,7 +184,11 @@ def process_inference(task: Vulnerability, cache: StaticAnalysisCache):
         calib_conf, final_pred = _conf_model.predict(feat_vector)
 
         # 6. 生成结果记录 (New Table)
-        kb_evidence_json = json.dumps([e.model_dump() for e in llm_result.kb_evidence]) if llm_result.kb_evidence else json.dumps([])
+        kb_evidence_json = (
+            json.dumps([e.model_dump() for e in llm_result.kb_evidence])
+            if llm_result.kb_evidence
+            else json.dumps([])
+        )
         prediction = Prediction(
             vuln_id=task.id,
             name=task.name,

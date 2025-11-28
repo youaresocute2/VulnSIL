@@ -11,8 +11,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import settings, init_runtime
 
-init_runtime()
-
 from vulnsil.database import get_db_session
 from vulnsil.models import Prediction, Vulnerability
 from vulnsil.utils_log import setup_logging
