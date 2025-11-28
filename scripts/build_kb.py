@@ -32,9 +32,14 @@ class Record:
 
     @classmethod
     def from_raw(cls, data: Dict, source: str) -> "Record":
+        raw_label = data.get("target")
+        try:
+            label_val = int(raw_label) if raw_label is not None else None
+        except Exception:
+            label_val = None
         return cls(
             code=data.get("func"),
-            label=data.get("target"),
+            label=label_val,
             cwe=data.get("cwe"),
             project=data.get("project"),
             commit_id=data.get("commit_id"),

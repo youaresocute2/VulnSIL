@@ -3,10 +3,10 @@
 import os
 import json
 import logging
-import multiprocessing
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+
 
 class Settings(BaseSettings):
     # --- 基础路径 ---
@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     # RAG资源
     FAISS_INDEX_PATH: str = os.path.join(RESULTS_DIR, 'faiss_index', 'kb.faiss')
+    FAISS_IDS_MAP_PATH: str = os.path.join(RESULTS_DIR, 'faiss_index', 'faiss_ids_map.json')
     BM25_INDEX_PATH: str = os.path.join(RESULTS_DIR, 'faiss_index', 'kb.bm25')
     RESOURCE_DIR: str = os.path.join(PROJECT_ROOT_DIR, 'vulnsil', 'resources')
     JOERN_SCRIPT_PATH: str = os.path.join(RESOURCE_DIR, 'query.sc')
@@ -99,24 +100,29 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    def model_post_init(self, __context):
-        # 仅在主进程打印日志
-        if multiprocessing.current_process().name == 'MainProcess':
-            if os.path.exists(self.CONFIDENCE_META_PATH):
-                try:
-                    with open(self.CONFIDENCE_META_PATH, 'r') as f:
-                        meta = json.load(f)
-                        best_th = meta.get("best_threshold")
-                        if best_th is not None:
-                            self.CALIBRATION_THRESHOLD = float(best_th)
-                            print(f"✅ [Config] Loaded Dynamic Threshold: {self.CALIBRATION_THRESHOLD:.4f}")
-                except Exception as e:
-                    print(f"⚠️ [Config] Failed to load threshold meta: {e}")
-            else:
-                print(f"ℹ️ [Config] Using Default Threshold: {self.CALIBRATION_THRESHOLD} (No meta file found)")
+    def update_threshold_from_meta(self) -> None:
+        if os.path.exists(self.CONFIDENCE_META_PATH):
+            try:
+                with open(self.CONFIDENCE_META_PATH, 'r') as f:
+                    meta = json.load(f)
+                    best_th = meta.get("best_threshold")
+                    if best_th is not None:
+                        self.CALIBRATION_THRESHOLD = float(best_th)
+                        print(f"✅ [Config] Loaded Dynamic Threshold: {self.CALIBRATION_THRESHOLD:.4f}")
+                        return
+            except Exception as e:
+                print(f"⚠️ [Config] Failed to load threshold meta: {e}")
+        print(f"ℹ️ [Config] Using Default Threshold: {self.CALIBRATION_THRESHOLD} (No meta file found)")
+
 
 settings = Settings()
 
-# 确保目录存在
-for path in [settings.RESULTS_DIR, settings.LOG_DIR, settings.DB_DIR, settings.STATIC_TMP_DIR]:
-    os.makedirs(path, exist_ok=True)
+
+def init_runtime():
+    """初始化运行时资源（仅在入口调用）"""
+    for path in [settings.RESULTS_DIR, settings.LOG_DIR, settings.DB_DIR, settings.STATIC_TMP_DIR]:
+        os.makedirs(path, exist_ok=True)
+
+    settings.update_threshold_from_meta()
+
+    logging.getLogger(__name__).info("[Config] Runtime initialized.")

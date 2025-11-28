@@ -11,32 +11,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, precision_recall_curve
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import settings
+from config import settings, init_runtime
+
 from vulnsil.database import get_db_session
-from vulnsil.models import AnalysisResultRecord, Vulnerability
+from vulnsil.models import Prediction, Vulnerability
 from vulnsil.utils_log import setup_logging
 
 app = typer.Typer()
 log = setup_logging("train_calibrator")
 
-# [更新] 15维特征列表（加graph_density）
-FEATURE_NAMES = [
-    "llm_native_conf",              # 1
-    "static_has_flow",              # 2
-    "static_complexity",            # 3
-    "static_apis_count",            # 4
-    "static_risk_density",          # 5
-    "source_type",                  # 6
-    "code_len_log",                 # 7
-    "is_compressed",                # 8
-    "rag_sim_avg",                  # 9
-    "rag_top1_sim",                 # 10
-    "rag_var",                      # 11
-    "conflict_disagree",            # 12
-    "conflict_static_yes_llm_no",   # 13
-    "llm_uncertainty",              # 14
-    "graph_density"                 # 15 新增
-]
+# [更新] 特征列表来源于配置，训练/推理保持一致
+FEATURE_NAMES = settings.DEFAULT_FEATURE_ORDER
 
 def custom_pca(X, n_components):
     """用numpy SVD实现PCA（环境兼容）"""
@@ -58,10 +43,11 @@ def find_best_threshold_f1(y_true, y_probs):
 
 @app.command()
 def train(split_name: str = typer.Option(..., help="Dataset prefix (e.g., 'confidence_train')")):
+    init_runtime()
     X, y = [], []
 
     with get_db_session() as db:
-        records = db.query(AnalysisResultRecord).join(Vulnerability).filter(
+        records = db.query(Prediction).join(Vulnerability).filter(
             Vulnerability.name.like(f"{split_name}%"),
             Vulnerability.status == "Success"
         ).all()
@@ -71,30 +57,14 @@ def train(split_name: str = typer.Option(..., help="Dataset prefix (e.g., 'confi
             return
 
         for r in records:
-            if r.final_decision is None:
-                continue
+            feat_dict = {}
+            if r.feature_json:
+                try:
+                    feat_dict = json.loads(r.feature_json)
+                except Exception:
+                    feat_dict = {}
 
-            # [改进] 加graph_density（假设从DB新增字段）
-            graph_density = r.feat_graph_density if hasattr(r, 'feat_graph_density') else 0.0
-
-            features = [
-                r.native_confidence,
-                1 if r.static_has_flow else 0,
-                r.static_complexity,
-                r.feat_static_apis_count,
-                r.feat_static_risk_density,
-                r.feat_static_source_type,
-                np.log1p(r.feat_code_len),
-                1 if r.feat_is_compressed else 0,
-                r.feat_rag_agreement,
-                r.feat_rag_top1_sim,
-                r.feat_rag_sim_variance,
-                r.feat_conflict_disagreement,
-                r.feat_conflict_static_yes_llm_no,
-                r.feat_llm_uncertainty,
-                graph_density  # 新增
-            ]
-
+            features = [float(feat_dict.get(name, 0.0)) for name in settings.DEFAULT_FEATURE_ORDER]
             label = 1 if r.vuln.ground_truth_label == 1 else 0
             X.append(features)
             y.append(label)
@@ -177,7 +147,8 @@ def train(split_name: str = typer.Option(..., help="Dataset prefix (e.g., 'confi
         "best_threshold": float(best_th),
         "best_f1": float(best_f1),
         "auc": float(val_auc),
-        "train_info": f"Split: {split_name}, Samples: {len(X)}"
+        "train_info": f"Split: {split_name}, Samples: {len(X)}",
+        "feature_names": settings.DEFAULT_FEATURE_ORDER
     }
     with open(meta_path, "w") as f:
         json.dump(meta_data, f, indent=2)

@@ -9,9 +9,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import settings
+from config import settings, init_runtime
+
 from vulnsil.database import get_db_session
-from vulnsil.models import Prediction, AnalysisResultRecord, Vulnerability
+from vulnsil.models import Prediction, Vulnerability
 from vulnsil.utils_log import setup_logging
 
 app = typer.Typer()
@@ -41,13 +42,13 @@ def get_metrics(y_true, y_pred, y_prob=None):
 @app.command()
 def eval(
         split_name: str = typer.Option(..., help="Target dataset split (e.g. diversevul_test)"),
-        force_threshold: float = typer.Option(None, help="Manually override calibration threshold"),
-        use_prediction_table: bool = typer.Option(True, help="Read from new Prediction table")
+        force_threshold: float = typer.Option(None, help="Manually override calibration threshold")
 ):
     """
     Evaluate Model Performance.
     Can switch between legacy results and new prediction table results.
     """
+    init_runtime()
     log.info(f"Evaluating Split: {split_name}")
     threshold = force_threshold if force_threshold is not None else settings.CALIBRATION_THRESHOLD
     log.info(f"Using Threshold: {threshold:.4f}")
@@ -55,37 +56,20 @@ def eval(
     data = []
 
     with get_db_session() as db:
-        if use_prediction_table:
-            log.info("Querying 'Prediction' table...")
-            # 连接 Prediction 和 Vulnerability 表
-            records = db.query(Prediction).join(Vulnerability).filter(
-                Vulnerability.name.like(f"{split_name}%")
-            ).all()
+        log.info("Querying 'Prediction' table...")
+        records = db.query(Prediction).join(Vulnerability).filter(
+            Vulnerability.name.like(f"{split_name}%")
+        ).all()
 
-            for r in records:
-                data.append({
-                    'gt': r.vuln.ground_truth_label,
-                    'raw_pred': r.llm_pred,
-                    'prob': r.calibrated_confidence,
-                    # 可以基于存储的 prob 动态调整阈值，而不是仅仅读 final_pred
-                    'cal_pred': 1 if r.calibrated_confidence >= threshold else 0,
-                    'cwe': r.vuln.cwe_id
-                })
-        else:
-            log.info("Querying 'AnalysisResultRecord' table (Legacy)...")
-            records = db.query(AnalysisResultRecord).join(Vulnerability).filter(
-                Vulnerability.name.like(f"{split_name}%")
-            ).all()
-
-            for r in records:
-                raw_flag = 1 if "VULNERABLE" in str(r.final_decision).upper() else 0
-                data.append({
-                    'gt': r.vuln.ground_truth_label,
-                    'raw_pred': raw_flag,
-                    'prob': r.calibrated_confidence,
-                    'cal_pred': 1 if r.calibrated_confidence >= threshold else 0,
-                    'cwe': r.vuln.cwe_id
-                })
+        for r in records:
+            data.append({
+                'gt': r.vuln.ground_truth_label,
+                'raw_pred': r.llm_pred,
+                'prob': r.calibrated_confidence,
+                # 可以基于存储的 prob 动态调整阈值，而不是仅仅读 final_pred
+                'cal_pred': 1 if r.calibrated_confidence >= threshold else 0,
+                'cwe': r.vuln.cwe_id
+            })
 
     if not data:
         log.error("No results found for this split.")

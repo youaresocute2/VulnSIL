@@ -13,6 +13,14 @@ from vulnsil.schemas import AnalysisResult, DecisionEnum
 logger = logging.getLogger("VLLMClient")
 
 
+def parse_bool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        return x.strip().lower() in ["1", "true", "yes", "y"]
+    return bool(x)
+
+
 class VLLMClient:
     """
     与本地 vLLM(OpenAI-compatible) 服务交互的客户端。
@@ -183,7 +191,7 @@ class VLLMClient:
         except Exception as e:
             logger.error(f"[VLLMClient] Pydantic validation failed: {e}")
             # 尝试做一个温和的 fallback，将部分字段填入
-            is_vul = bool(raw_obj.get("is_vulnerable", False)) if isinstance(raw_obj, dict) else False
+            is_vul = parse_bool(raw_obj.get("is_vulnerable", False)) if isinstance(raw_obj, dict) else False
             conf = float(raw_obj.get("confidence", 0.0)) if isinstance(raw_obj, dict) else 0.0
             reasoning = str(raw_obj.get("reasoning", "")) if isinstance(raw_obj, dict) else ""
             decision_str = str(raw_obj.get("decision", "unknown")) if isinstance(raw_obj, dict) else "unknown"
