@@ -54,6 +54,7 @@ def scan_rag_folder(base_dir: Path) -> List[Dict]:
                         "label": label,
                         "cwe_id": data.get("cwe") or "N/A",
                         "source_dataset": data.get("project") or path.stem,
+                        "commit_id": data.get("commit_id") or None,
                     }
                     records.append(record)
         except Exception as exc:
@@ -67,6 +68,7 @@ def write_to_database(records: List[Dict]) -> None:
     Base.metadata.create_all(bind=engine)
 
     with get_db_session() as db:
+        logger.warning("⚠️ Clearing KnowledgeBase table before rebuild.")
         db.query(KnowledgeBase).delete()
         batch_size = settings.KB_BUILD_BATCH_INSERT_SIZE
         buffer: List[KnowledgeBase] = []
@@ -77,6 +79,7 @@ def write_to_database(records: List[Dict]) -> None:
                 label=rec["label"],
                 cwe_id=rec["cwe_id"],
                 source_dataset=rec["source_dataset"],
+                commit_id=rec["commit_id"],
             )
             buffer.append(obj)
             if len(buffer) >= batch_size:
@@ -137,7 +140,8 @@ def build_bm25_index(entries: List[KnowledgeBase], ids_map: Dict[str, int]) -> N
 
     bm25_model = BM25Okapi(corpus_tokens)
 
-    payload = {"model": bm25_model, "ids": [ids_map[str(i)] for i in range(len(ids_map))]}
+    ordered_ids = [ids_map[k] for k in sorted(ids_map.keys(), key=lambda x: int(x))]
+    payload = {"model": bm25_model, "ids": ordered_ids}
     os.makedirs(Path(settings.BM25_INDEX_PATH).parent, exist_ok=True)
     with open(settings.BM25_INDEX_PATH, "wb") as f:
         pickle.dump(payload, f)
@@ -145,6 +149,16 @@ def build_bm25_index(entries: List[KnowledgeBase], ids_map: Dict[str, int]) -> N
 
 def main():
     data_dir = Path(settings.DATA_DIR) / "data_RAG"
+
+    if not Path(settings.DATA_DIR).exists():
+        logger.error(f"DATA_DIR not found: {settings.DATA_DIR}")
+        return
+
+    if not data_dir.exists():
+        logger.error(f"RAG folder not found: {data_dir}")
+        return
+
+    logger.info("Scanning path: %s", data_dir)
     records = scan_rag_folder(data_dir)
     if not records:
         logger.warning("No records found. Exiting.")
