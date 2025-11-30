@@ -15,6 +15,7 @@ Build a balanced RAG knowledge base from DiverseVul-Train and VCLData.
   - real:syn = 20000 : 20000
 
 采样策略：
+- [新增] 预先筛选：去除代码为空或无效的样本，防止静态分析失效
 - 对每个数据源、每个标签（0/1）分别进行近似分层采样（按 (cwe, project)）
 - 样本不足时打印警告并返回全部可用记录
 """
@@ -25,7 +26,6 @@ import random
 import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
-
 
 Record = Dict[str, Any]
 
@@ -51,6 +51,31 @@ def write_jsonl(path: str, records: List[Record]) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def filter_invalid_records(records: List[Record], source_name: str = "dataset") -> List[Record]:
+    """
+    [新增功能] 筛选无效记录：
+    1. 代码内容为空 (func 或 code 字段)
+    2. 只有空白字符
+    """
+    valid_records = []
+    filtered_count = 0
+
+    for rec in records:
+        # 兼容 func 和 code 字段名
+        code = rec.get("func", "") or rec.get("code", "")
+
+        # 检查是否为空或仅含空格
+        if not code or not str(code).strip():
+            filtered_count += 1
+            continue
+
+        valid_records.append(rec)
+
+    print(
+        f"[INFO] [{source_name}] Filtered out {filtered_count} invalid records (empty code). Remaining: {len(valid_records)}")
+    return valid_records
+
+
 def get_stratum_key(rec: Record) -> Tuple[str, str]:
     cwe = rec.get("cwe") or "None"
     project = rec.get("project") or "unknown"
@@ -66,10 +91,10 @@ def group_by_stratum(records: List[Record]) -> Dict[Tuple[str, str], List[Record
 
 
 def stratified_sample(
-    records: List[Record],
-    target_n: int,
-    rng: random.Random,
-    label_desc: str,
+        records: List[Record],
+        target_n: int,
+        rng: random.Random,
+        label_desc: str,
 ) -> List[Record]:
     """
     与前面脚本类似的近似分层采样，用于构造 RAG KB 中某个子集。
@@ -139,11 +164,11 @@ def stratified_sample(
 
 
 def build_kb_for_source(
-    records: List[Record],
-    pos_target: int,
-    neg_target: int,
-    rng: random.Random,
-    source_name: str,
+        records: List[Record],
+        pos_target: int,
+        neg_target: int,
+        rng: random.Random,
+        source_name: str,
 ) -> List[Record]:
     """
     为一个数据源（diversevul/vcldata）构建 pos/neg 平衡子集。
@@ -151,7 +176,7 @@ def build_kb_for_source(
     pos = [r for r in records if int(r.get("target", 0)) == 1]
     neg = [r for r in records if int(r.get("target", 0)) == 0]
 
-    print(f"[INFO] Source={source_name}: total={len(records)}, pos={len(pos)}, neg={len(neg)}")
+    print(f"[INFO] Source={source_name}: filtered total={len(records)}, pos={len(pos)}, neg={len(neg)}")
 
     pos_selected = stratified_sample(pos, pos_target, rng, label_desc=f"{source_name}_pos")
     neg_selected = stratified_sample(neg, neg_target, rng, label_desc=f"{source_name}_neg")
@@ -174,8 +199,10 @@ def main() -> None:
     parser.add_argument("--vcldata", required=True, help="Path to vcldata_norm.jsonl (normalized)")
     parser.add_argument("--output", required=True, help="Output path for rag_kb.jsonl")
 
-    parser.add_argument("--real-pos", type=int, default=10000, help="# of positive samples from DiverseVul (default 10000)")
-    parser.add_argument("--real-neg", type=int, default=10000, help="# of negative samples from DiverseVul (default 10000)")
+    parser.add_argument("--real-pos", type=int, default=10000,
+                        help="# of positive samples from DiverseVul (default 10000)")
+    parser.add_argument("--real-neg", type=int, default=10000,
+                        help="# of negative samples from DiverseVul (default 10000)")
     parser.add_argument("--syn-pos", type=int, default=10000, help="# of positive samples from VCLData (default 10000)")
     parser.add_argument("--syn-neg", type=int, default=10000, help="# of negative samples from VCLData (default 10000)")
 
@@ -190,6 +217,10 @@ def main() -> None:
 
     print(f"[INFO] Loaded {len(diverse_records)} records from {args.diversevul_train}")
     print(f"[INFO] Loaded {len(vcl_records)} records from {args.vcldata}")
+
+    # [新增] 过滤无效数据
+    diverse_records = filter_invalid_records(diverse_records, source_name="DiverseVul")
+    vcl_records = filter_invalid_records(vcl_records, source_name="VCLData")
 
     kb_real = build_kb_for_source(
         diverse_records,
@@ -212,8 +243,8 @@ def main() -> None:
 
     print(
         f"[INFO] Final KB size={len(kb_all)} "
-        f"(pos={len([r for r in kb_all if int(r.get('target',0))==1])}, "
-        f"neg={len([r for r in kb_all if int(r.get('target',0))==0])})"
+        f"(pos={len([r for r in kb_all if int(r.get('target', 0)) == 1])}, "
+        f"neg={len([r for r in kb_all if int(r.get('target', 0)) == 0])})"
     )
 
     write_jsonl(args.output, kb_all)

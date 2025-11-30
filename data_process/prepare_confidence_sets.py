@@ -18,6 +18,7 @@ Prepare calibration training/validation sets for confidence model from DiverseVu
 - d_cal_val.jsonl   :  2000 条，pos:neg = 2:3 =>  800 vuln, 1200 safe
 
 采样策略：
+- [新增] 预先筛选：去除代码为空或无效的样本，防止静态分析失效
 - 先按照 (cwe, project) 进行近似分层采样，按原始分布分配配额
 - 若某个分层不足，则取全部，剩余配额在其他分层中随机补齐（fallback）
 - train 与 val 两个集合互斥
@@ -29,7 +30,6 @@ import random
 import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
-
 
 Record = Dict[str, Any]
 
@@ -55,6 +55,33 @@ def write_jsonl(path: str, records: List[Record]) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def filter_invalid_records(records: List[Record]) -> List[Record]:
+    """
+    [新增功能] 筛选无效记录：
+    1. 代码内容为空 (func 或 code 字段)
+    2. 只有空白字符
+    """
+    valid_records = []
+    filtered_count = 0
+
+    for rec in records:
+        # 兼容 func 和 code 字段名
+        code = rec.get("func", "") or rec.get("code", "")
+
+        # 检查是否为空或仅含空格
+        if not code or not str(code).strip():
+            filtered_count += 1
+            # 可选：打印被过滤的 ID 方便调试
+            # commit = rec.get("commit_id", "unk")
+            # print(f"[DEBUG] Filtered invalid record: commit_id={commit}")
+            continue
+
+        valid_records.append(rec)
+
+    print(f"[INFO] Filtered out {filtered_count} invalid records (empty code).")
+    return valid_records
+
+
 def get_stratum_key(rec: Record) -> Tuple[str, str]:
     """
     分层键： (cwe, project)
@@ -74,10 +101,10 @@ def group_by_stratum(records: List[Record]) -> Dict[Tuple[str, str], List[Record
 
 
 def stratified_sample(
-    records: List[Record],
-    target_n: int,
-    rng: random.Random,
-    label_name: str,
+        records: List[Record],
+        target_n: int,
+        rng: random.Random,
+        label_name: str,
 ) -> List[Record]:
     """
     对 records 做近似分层采样，分层依据 (cwe, project)。
@@ -113,7 +140,6 @@ def stratified_sample(
         quotas[key] = int(round(frac * target_n))
 
     # 调整 quotas 的总和为 target_n（防止四舍五入误差）
-    # 先按 quotas 总和，如果差值不为 0 就微调
     quota_sum = sum(quotas.values())
     delta = target_n - quota_sum
     if delta != 0:
@@ -163,12 +189,12 @@ def stratified_sample(
 
 
 def prepare_calibration_sets(
-    records: List[Record],
-    train_pos: int,
-    train_neg: int,
-    val_pos: int,
-    val_neg: int,
-    seed: int = 42,
+        records: List[Record],
+        train_pos: int,
+        train_neg: int,
+        val_pos: int,
+        val_neg: int,
+        seed: int = 42,
 ) -> Tuple[List[Record], List[Record]]:
     """
     根据给定的正负数量，构造 D_cal_train 和 D_cal_val。
@@ -184,8 +210,8 @@ def prepare_calibration_sets(
     pos_all = [r for r in records if int(r.get("target", 0)) == 1]
     neg_all = [r for r in records if int(r.get("target", 0)) == 0]
 
-    print(f"[INFO] Total pos in train_full: {len(pos_all)}")
-    print(f"[INFO] Total neg in train_full: {len(neg_all)}")
+    print(f"[INFO] Total pos in filtered pool: {len(pos_all)}")
+    print(f"[INFO] Total neg in filtered pool: {len(neg_all)}")
 
     # 1) 构建 D_cal_train
     train_pos_records = stratified_sample(pos_all, train_pos, rng, label_name="pos_train")
@@ -218,17 +244,25 @@ def main() -> None:
     parser.add_argument("--train-output", required=True, help="Output path for D_cal_train JSONL")
     parser.add_argument("--val-output", required=True, help="Output path for D_cal_val JSONL")
 
-    parser.add_argument("--train-pos", type=int, default=4000, help="Number of positive samples for train (default 4000)")
-    parser.add_argument("--train-neg", type=int, default=6000, help="Number of negative samples for train (default 6000)")
+    parser.add_argument("--train-pos", type=int, default=4000,
+                        help="Number of positive samples for train (default 4000)")
+    parser.add_argument("--train-neg", type=int, default=6000,
+                        help="Number of negative samples for train (default 6000)")
     parser.add_argument("--val-pos", type=int, default=800, help="Number of positive samples for val (default 800)")
     parser.add_argument("--val-neg", type=int, default=1200, help="Number of negative samples for val (default 1200)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     args = parser.parse_args()
 
+    # 1. 读取原始数据
     records = read_jsonl(args.input)
     print(f"[INFO] Loaded {len(records)} records from {args.input}")
 
+    # 2. [关键] 过滤不合法数据
+    records = filter_invalid_records(records)
+    print(f"[INFO] Records available for sampling: {len(records)}")
+
+    # 3. 分层采样
     d_cal_train, d_cal_val = prepare_calibration_sets(
         records,
         train_pos=args.train_pos,
@@ -238,6 +272,7 @@ def main() -> None:
         seed=args.seed,
     )
 
+    # 4. 写入结果
     write_jsonl(args.train_output, d_cal_train)
     print(f"[INFO] Wrote D_cal_train to {args.train_output}")
 

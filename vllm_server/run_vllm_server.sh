@@ -10,7 +10,7 @@ PORT="8000"
 
 PYTHON_PATH="/home/daiwenju/.conda/envs/vulnsil/bin/python"
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 echo "Starting vLLM server for model: $SERVED_MODEL_NAME"
 echo "Model path: $MODEL_DIR"
